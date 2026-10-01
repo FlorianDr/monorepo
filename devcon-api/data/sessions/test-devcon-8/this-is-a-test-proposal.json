@@ -1,0 +1,25 @@
+{
+  "id": "this-is-a-test-proposal",
+  "sourceId": "SHTLDN",
+  "title": "This is a test proposal",
+  "description": "This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text  This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text This is a test proposal text",
+  "track": "Core Protocol",
+  "type": "Lightning Talk  (5\"Talk+2\"Q&A)",
+  "expertise": "",
+  "audience": "",
+  "featured": false,
+  "doNotRecord": false,
+  "keywords": [],
+  "tags": [
+    "Privacy",
+    "hello"
+  ],
+  "language": "en",
+  "speakers": [
+    "didier-external"
+  ],
+  "eventId": "test-devcon-8",
+  "slot_start": 1793678820000,
+  "slot_end": 1793679240000,
+  "slot_roomId": "keynote-stage"
+}
