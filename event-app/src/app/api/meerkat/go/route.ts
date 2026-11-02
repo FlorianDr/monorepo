@@ -56,7 +56,8 @@ export async function GET(request: NextRequest) {
   // when the visitor goes away.
   const work = new AbortController();
   const stop = () => work.abort();
-  request.signal.addEventListener("abort", stop, { once: true });
+  if (request.signal.aborted) stop();
+  else request.signal.addEventListener("abort", stop, { once: true });
   try {
     return await handOff(request, sessionId, back, work.signal);
   } finally {
@@ -140,6 +141,8 @@ async function handOff(
       signal
     );
   } catch (err) {
+    // The visitor left and the lookups were cancelled: nothing failed.
+    if (signal.aborted) return new NextResponse(null, { status: 499 });
     console.error("[/api/meerkat/go] ticket lookup failed:", err);
     return page(502, "Couldn't verify your ticket", "The ticket service didn't answer. Please try again in a moment.", { back });
   }

@@ -494,6 +494,59 @@ export function pretixLookupOutcome(res: { ok: boolean; status: number }): "ok" 
 }
 
 /**
+ * Re-verifies attached links against Pretix, for the tickets screen and the
+ * Q&A hand-off alike. The returned function resolves to the link's position
+ * and order while it still holds, or null when it is dead: position or order
+ * gone (404), unpaid, canceled, merchandise or an add-on, or an email-proof
+ * link whose position no longer carries the account's email (the buyer
+ * reassigned that ticket to its holder). A transient Pretix error throws, so
+ * a 429 or 500 can never be mistaken for a dead link and delete it. Several
+ * links can share an order; each order is fetched once.
+ */
+function linkVerifier(
+  store: PretixStore,
+  email: string,
+  catalog: Promise<Map<number, PretixItem>>,
+  signal?: AbortSignal
+): (link: TicketLink) => Promise<{ position: PretixPosition; order: PretixOrder } | null> {
+  const headers = headersFor(store);
+  const orderCache = new Map<string, Promise<PretixOrder | null>>();
+  const fetchOrder = (code: string): Promise<PretixOrder | null> => {
+    let pending = orderCache.get(code);
+    if (!pending) {
+      pending = fetch(`${baseFor(store)}/orders/${encodeURIComponent(code)}/`, {
+        headers,
+        signal,
+      }).then((r) => {
+        const outcome = pretixLookupOutcome(r);
+        if (outcome === "missing") return null;
+        if (outcome === "failed") throw new Error(`Pretix API error: ${r.status}`);
+        return r.json() as Promise<PretixOrder>;
+      });
+      // Shared by links that may stop waiting: never an unhandled rejection.
+      pending.catch(() => {});
+      orderCache.set(code, pending);
+    }
+    return pending;
+  };
+  return async ({ positionId, proof }) => {
+    const res = await fetch(`${baseFor(store)}/orderpositions/${positionId}/`, {
+      headers,
+      signal,
+    });
+    const outcome = pretixLookupOutcome(res);
+    if (outcome === "missing") return null;
+    if (outcome === "failed") throw new Error(`Pretix API error: ${res.status}`);
+    const position: PretixPosition = await res.json();
+    const order = await fetchOrder(position.order);
+    const itemsMap = await catalog;
+    if (!order || !isAttachablePosition(position, order, itemsMap)) return null;
+    if (proof === "email" && !positionMatchesEmail(position, order.email, email)) return null;
+    return { position, order };
+  };
+}
+
+/**
  * Everything the account may see: attached positions first (flagged), then
  * email-matched orders. Each link is re-verified against Pretix: a position
  * that is gone, on an unpaid order, or canceled is reported in `deadLinks` so
@@ -506,29 +559,9 @@ export async function getTicketsForUser(
   store: PretixStore
 ): Promise<{ orders: Order[]; deadLinks: number[] }> {
   const itemsMap = await loadCatalog(store);
-  const headers = headersFor(store);
   const deadLinks: number[] = [];
   const attachedRaw: Array<{ order: PretixOrder; positionId: number; proof: LinkProof }> = [];
-
-  // Several attached positions can share an order; fetch each order once.
-  // Null only for a 404 (order gone): a transient Pretix error throws, so a
-  // 429 or 500 can never be mistaken for a dead link and delete it.
-  const orderCache = new Map<string, Promise<PretixOrder | null>>();
-  const fetchOrder = (code: string): Promise<PretixOrder | null> => {
-    let pending = orderCache.get(code);
-    if (!pending) {
-      pending = fetch(`${baseFor(store)}/orders/${encodeURIComponent(code)}/`, {
-        headers,
-      }).then((r) => {
-        const outcome = pretixLookupOutcome(r);
-        if (outcome === "missing") return null;
-        if (outcome === "failed") throw new Error(`Pretix API error: ${r.status}`);
-        return r.json() as Promise<PretixOrder>;
-      });
-      orderCache.set(code, pending);
-    }
-    return pending;
-  };
+  const verify = linkVerifier(store, opts.email, Promise.resolve(itemsMap));
 
   // Fixture tickets (dev/preview) carry negative ids: no Pretix lookup, they
   // are marked attached once the fixture has been applied below.
@@ -536,27 +569,13 @@ export async function getTicketsForUser(
   const realLinks = opts.links.filter((link) => !isFixturePositionId(link.positionId));
 
   await Promise.all(
-    realLinks.map(async ({ positionId, proof }) => {
-      const res = await fetch(`${baseFor(store)}/orderpositions/${positionId}/`, {
-        headers,
-      });
-      const outcome = pretixLookupOutcome(res);
-      if (outcome === "missing") {
-        deadLinks.push(positionId);
+    realLinks.map(async (link) => {
+      const verified = await verify(link);
+      if (!verified) {
+        deadLinks.push(link.positionId);
         return;
       }
-      if (outcome === "failed") throw new Error(`Pretix API error: ${res.status}`);
-      const position: PretixPosition = await res.json();
-      const order = await fetchOrder(position.order);
-      if (!order || !isAttachablePosition(position, order, itemsMap)) {
-        deadLinks.push(positionId);
-        return;
-      }
-      if (proof === "email" && !positionMatchesEmail(position, order.email, opts.email)) {
-        deadLinks.push(positionId);
-        return;
-      }
-      attachedRaw.push({ order, positionId, proof: proof ?? "qr" });
+      attachedRaw.push({ order: verified.order, positionId: link.positionId, proof: link.proof ?? "qr" });
     })
   );
 
@@ -668,12 +687,14 @@ export function anyTrue(checks: Promise<boolean>[]): Promise<boolean> {
  * Whether the account holds an admission ticket: the yes-or-no behind the
  * Meerkat hand-off (api/meerkat/go/route.ts), without the work the tickets
  * screen needs (no photo mirroring, no normalised orders, no dead-link
- * pruning). Same verdict as getTicketsForUser + hasAdmissionTicket.
+ * pruning). Same answer as getTicketsForUser + hasAdmissionTicket while
+ * Pretix and Supabase answer; under a partial outage it is more lenient: a
+ * failed source only matters when no other said yes (then it throws, as the
+ * full lookup would), so an email-matched holder still gets a yes when a
+ * links lookup fails, where the full lookup throws.
  *
  * The email search and each attached link run in parallel; the first that
- * finds a ticket answers and cancels the rest through `signal`'s own child.
- * A failed source only matters when no other said yes (then it throws, as
- * the full lookup would). `links` may still be loading and `emailOrders` may
+ * finds a ticket answers and cancels the rest through `signal`'s own child. `links` may still be loading and `emailOrders` may
  * have been started by the caller (it is then the caller's to cancel). The
  * catalog fetch is shared and cached, so it is never cancelled.
  */
@@ -694,7 +715,6 @@ export async function ownsAdmissionTicket(
 
   const done = new AbortController();
   const cancel = signal ? AbortSignal.any([signal, done.signal]) : done.signal;
-  const headers = headersFor(store);
   const catalog = loadCatalog(store);
   catalog.catch(() => {});
 
@@ -710,44 +730,12 @@ export async function ownsAdmissionTicket(
     );
   };
 
-  // Several attached positions can share an order; fetch each order once.
-  const orderCache = new Map<string, Promise<PretixOrder | null>>();
-  const fetchOrder = (code: string): Promise<PretixOrder | null> => {
-    let pending = orderCache.get(code);
-    if (!pending) {
-      pending = fetch(`${baseFor(store)}/orders/${encodeURIComponent(code)}/`, {
-        headers,
-        signal: cancel,
-      }).then((r) => {
-        const outcome = pretixLookupOutcome(r);
-        if (outcome === "missing") return null;
-        if (outcome === "failed") throw new Error(`Pretix API error: ${r.status}`);
-        return r.json() as Promise<PretixOrder>;
-      });
-      pending.catch(() => {});
-      orderCache.set(code, pending);
-    }
-    return pending;
-  };
-
-  const viaLink = async ({ positionId, proof }: TicketLink): Promise<boolean> => {
+  const verify = linkVerifier(store, lookup.email, catalog, cancel);
+  const viaLink = async (link: TicketLink): Promise<boolean> => {
     // Fixture links only resolve with the fixture configured (handled above).
-    if (isFixturePositionId(positionId)) return false;
-    const res = await fetch(`${baseFor(store)}/orderpositions/${positionId}/`, {
-      headers,
-      signal: cancel,
-    });
-    const outcome = pretixLookupOutcome(res);
-    if (outcome === "missing") return false;
-    if (outcome === "failed") throw new Error(`Pretix API error: ${res.status}`);
-    const position: PretixPosition = await res.json();
-    const order = await fetchOrder(position.order);
-    const itemsMap = await catalog;
-    if (!order || !isAttachablePosition(position, order, itemsMap)) return false;
-    if (proof === "email" && !positionMatchesEmail(position, order.email, lookup.email)) {
-      return false;
-    }
-    return positionCountsAsAdmission(position, itemsMap);
+    if (isFixturePositionId(link.positionId)) return false;
+    const verified = await verify(link);
+    return !!verified && positionCountsAsAdmission(verified.position, await catalog);
   };
 
   const viaLinks = async (): Promise<boolean> => anyTrue((await lookup.links).map(viaLink));

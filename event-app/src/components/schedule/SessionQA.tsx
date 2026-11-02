@@ -188,15 +188,16 @@ function QAFeed({
   const standalone = useStandalone();
   const opening = useOpening();
   const onAsk = (event: MouseEvent<HTMLAnchorElement>) => {
-    // A second tap while the first is still opening would open a second tab.
-    if (opening.active) {
+    // Only a plain tap shows "Opening…": a modified or middle click opens
+    // beside this page, which never tells us when it is done, and always
+    // goes through.
+    const plain = event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+    // A second plain tap while the first is still opening would open a second tab.
+    if (plain && opening.active) {
       event.preventDefault();
       return;
     }
     trackEvent("session", "qa", sessionId);
-    // Only a plain tap: a modified or middle click opens beside this page,
-    // which never tells us when it is done.
-    const plain = event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
     if (plain) opening.start();
   };
 
