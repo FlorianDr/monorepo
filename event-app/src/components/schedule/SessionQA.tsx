@@ -2,9 +2,10 @@
 
 import { trackEvent } from "@/data/analytics/track";
 import cn from "classnames";
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore, type MouseEvent } from "react";
 import {
   ArrowUpRight,
+  Loader2,
   Check,
   ChevronUp,
   MessageCircleOff,
@@ -185,6 +186,19 @@ function QAFeed({
   const notOpen = notFound && !onNotFound;
   const preview = usePreviewQA();
   const standalone = useStandalone();
+  const opening = useOpening();
+  const onAsk = (event: MouseEvent<HTMLAnchorElement>) => {
+    // A second tap while the first is still opening would open a second tab.
+    if (opening.active) {
+      event.preventDefault();
+      return;
+    }
+    trackEvent("session", "qa", sessionId);
+    // Only a plain tap: a modified or middle click opens beside this page,
+    // which never tells us when it is done.
+    const plain = event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
+    if (plain) opening.start();
+  };
 
   return (
     <div className={cn("flex flex-col gap-3", size === "md" && "lg:grow")}>
@@ -231,11 +245,16 @@ function QAFeed({
               href={`/api/meerkat/go?session=${encodeURIComponent(sessionId)}`}
               target={standalone ? undefined : "_blank"}
               rel="noopener noreferrer"
-              onClick={() => trackEvent("session", "qa", sessionId)}
+              onClick={onAsk}
+              aria-disabled={opening.active || undefined}
               className={QA_CTA_CLASS}
             >
-              Ask a question
-              <ArrowUpRight className="size-4" aria-hidden />
+              {opening.active ? "Opening…" : "Ask a question"}
+              {opening.active ? (
+                <Loader2 className="size-4 animate-spin" aria-hidden />
+              ) : (
+                <ArrowUpRight className="size-4" aria-hidden />
+              )}
             </PrimaryAnchorButton>
           )}
         </div>
@@ -272,6 +291,36 @@ function QAFeed({
       )}
     </div>
   );
+}
+
+/** The "Opening…" state always clears after this, whatever became of the navigation. */
+const OPENING_RESET_MS = 15_000;
+
+/**
+ * "Opening…" on the Ask button while /api/meerkat/go checks the ticket. In
+ * the installed app the page stays on screen until Meerkat answers; in a
+ * browser the new tab takes over. Clears when the page is hidden (the new
+ * tab) or shown again (focus, return from the back/forward cache, whose
+ * frozen timers would otherwise keep it spinning), and always after
+ * OPENING_RESET_MS.
+ */
+function useOpening(): { active: boolean; start: () => void } {
+  const [active, setActive] = useState(false);
+  useEffect(() => {
+    if (!active) return;
+    const reset = () => setActive(false);
+    const timer = setTimeout(reset, OPENING_RESET_MS);
+    document.addEventListener("visibilitychange", reset);
+    window.addEventListener("focus", reset);
+    window.addEventListener("pageshow", reset);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener("visibilitychange", reset);
+      window.removeEventListener("focus", reset);
+      window.removeEventListener("pageshow", reset);
+    };
+  }, [active]);
+  return { active, start: () => setActive(true) };
 }
 
 /** Full width; no shadow of its own, the band carries it. */

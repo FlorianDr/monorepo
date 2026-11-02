@@ -32,7 +32,8 @@ import { whenControlled, type ServiceWorkerControl } from "../src/utils/serviceW
 import { buyerOrdersToAssign, derivePrimary, hasAdmissionTicket, ticketChoices, ticketOrdinals, ticketPrompt } from "../src/data/tickets/primary";
 import type { Order } from "../src/data/tickets/types";
 import { createRateLimiter } from "../src/app/api/tickets/rateLimit";
-import { positionCollected, positionMatchesEmail, pretixLookupOutcome, redactBuyerIdentity } from "../src/app/api/tickets/pretix";
+import { anyTrue, ownsAdmissionTicket, positionCollected, positionCountsAsAdmission, positionMatchesEmail, pretixLookupOutcome, redactBuyerIdentity, type PretixOrder, type PretixPosition, type PretixStore } from "../src/app/api/tickets/pretix";
+import { canStartEarly, resolveIdentity } from "../src/app/api/meerkat/earlyStart";
 import {
   applyLink,
   assistantUrl,
@@ -79,7 +80,7 @@ import {
 } from "../src/data/reminders/reminders";
 import { RETURN_PARAM, safeReturnPath, signInHref } from "../src/routing/returnTo";
 import { syncSessionCookie, whenSessionCookieSettled } from "../src/data/auth/sessionCookie";
-import { authCookieName, jwtExpiresAt, parseAuthCookie } from "../src/data/auth/authCookie";
+import { authCookieName, jwtClaims, jwtExpiresAt, parseAuthCookie } from "../src/data/auth/authCookie";
 import { HEAL_EXPIRY_MARGIN_S, healScriptBody } from "../src/app/api/meerkat/go/heal";
 import { createSupabaseFetch, isTokenRateLimit } from "../src/data/auth/supabaseFetch";
 import { sessionCardHash, sessionCardUrl } from "../src/data/sessionCard";
@@ -1570,11 +1571,171 @@ function testLiveWindowAndStreams() {
   check("rooms without a stream have none", streamEmbedUrlForRoom("music-stage") === null && streamEmbedUrlForRoom("cls-builders-room") === null && streamEmbedUrlForRoom(undefined) === null);
 }
 
+/**
+ * The fast Meerkat hand-off (api/meerkat/go): the unverified head start and
+ * the lean ticket check, against a stubbed Pretix.
+ */
+async function testMeerkatFastPath() {
+  // jwtClaims: a hint read without verification.
+  const jwt = (payload: unknown) =>
+    `h.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.s`;
+  check("fast path: jwtClaims reads email and exp", eq(jwtClaims(jwt({ email: "a@x.io", exp: 5 })), { email: "a@x.io", exp: 5 }));
+  check(
+    "fast path: jwtClaims refuses tokens without a string email or numeric exp",
+    jwtClaims(jwt({ exp: 5 })) === null && jwtClaims(jwt({ email: "a@x.io" })) === null && jwtClaims("not-a-jwt") === null
+  );
+  check("fast path: jwtExpiresAt still reads exp", jwtExpiresAt(jwt({ exp: 7 })) === 7);
+
+  // canStartEarly: Netlify's address only, within both budgets.
+  const limits = (perIp: number, global: number) => ({
+    perIp: createRateLimiter(perIp, 60_000),
+    global: createRateLimiter(global, 60_000),
+  });
+  check("fast path: no head start without Netlify's client address", !canStartEarly(null, limits(5, 5)));
+  const perIp = limits(1, 5);
+  check("fast path: per-address budget", canStartEarly("1.1.1.1", perIp) && !canStartEarly("1.1.1.1", perIp) && canStartEarly("2.2.2.2", perIp));
+  const global = limits(5, 1);
+  check("fast path: global cap per instance", canStartEarly("1.1.1.1", global) && !canStartEarly("2.2.2.2", global));
+
+  // resolveIdentity: the claim counts only for the very same verified email.
+  check(
+    "fast path: identity resolution",
+    resolveIdentity("a@x.io", "a@x.io") === "reuse" &&
+      resolveIdentity("old@x.io", "new@x.io") === "restart" &&
+      resolveIdentity("a@x.io", null) === "unauthenticated"
+  );
+
+  // positionCountsAsAdmission mirrors normalizeOrder + isAdmission.
+  const items = new Map([
+    [1, { id: 1, name: "Ticket", admission: true }],
+    [2, { id: 2, name: "Shirt", admission: false }],
+    [3, { id: 3, name: "Unflagged" }],
+  ]);
+  const pos = (over: Partial<PretixPosition>): PretixPosition => ({ id: 10, order: "ABC", item: 1, price: "1", secret: "s", ...over });
+  check("fast path: admission item counts", positionCountsAsAdmission(pos({}), items));
+  check("fast path: unknown item counts", positionCountsAsAdmission(pos({ item: 99 }), items));
+  check("fast path: merchandise does not count", !positionCountsAsAdmission(pos({ item: 2 }), items));
+  check("fast path: item without the admission flag does not count", !positionCountsAsAdmission(pos({ item: 3 }), items));
+  check("fast path: add-ons and canceled positions do not count", !positionCountsAsAdmission(pos({ addon_to: 9 }), items) && !positionCountsAsAdmission(pos({ canceled: true }), items));
+
+  // anyTrue: first yes wins; errors only when nobody said yes.
+  const never = new Promise<boolean>(() => {});
+  const fail = () => Promise.reject(new Error("down"));
+  check("fast path: anyTrue answers on the first yes", await anyTrue([never, Promise.resolve(true)]));
+  check("fast path: anyTrue is false when all say no", !(await anyTrue([Promise.resolve(false), Promise.resolve(false)])) && !(await anyTrue([])));
+  check("fast path: anyTrue ignores a failure when another says yes", await anyTrue([fail(), Promise.resolve(true)]));
+  check("fast path: anyTrue throws when nobody says yes and one failed", await anyTrue([fail(), Promise.resolve(false)]).then(() => false, () => true));
+
+  // ownsAdmissionTicket against a stubbed Pretix.
+  const store: PretixStore = { url: "https://pretix.test", organizerSlug: "o", eventSlug: "e", eventName: "Devcon", apiKey: "k" };
+  const base = "https://pretix.test/api/v1/organizers/o/events/e";
+  const order = (code: string, email: string, positions: PretixPosition[], status = "p"): PretixOrder => ({ code, status, email, datetime: "", positions });
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+  const hang = (signal?: AbortSignal | null) =>
+    new Promise<Response>((_, reject) => signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError"))));
+  type Calls = { url: string; signal?: AbortSignal | null }[];
+  const withPretix = async <T,>(
+    route: (path: string, signal?: AbortSignal | null) => Promise<Response> | Response,
+    run: (calls: Calls) => Promise<T>
+  ): Promise<T> => {
+    const calls: Calls = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, signal: init?.signal });
+      if (url === `${base}/items/`) return json({ results: [...items.values()] });
+      return route(url.slice(base.length), init?.signal);
+    }) as typeof fetch;
+    try {
+      return await run(calls);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  };
+  const savedFixture = process.env.TICKET_TEST_INDIA_ORDER_CODE;
+  delete process.env.TICKET_TEST_INDIA_ORDER_CODE;
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  const me = "me@x.io";
+  const owns = (links: Promise<{ positionId: number; proof?: "email" | "qr" }[]>, emailOrders?: Promise<PretixOrder[]>) =>
+    ownsAdmissionTicket({ email: me, links, emailOrders }, store);
+
+  await withPretix(
+    (path, signal) => (path.startsWith("/orders?") ? json({ results: [order("A", me, [pos({})])] }) : hang(signal)),
+    async (calls) => {
+      check("fast path: email match answers yes", await owns(Promise.resolve([{ positionId: 10 }])));
+      const link = calls.find((c) => c.url.includes("/orderpositions/"));
+      const catalog = calls.find((c) => c.url.endsWith("/items/"));
+      check("fast path: the yes cancels the other lookups", !!link?.signal?.aborted);
+      check("fast path: the cached catalog fetch is never cancelled", !!catalog && !catalog.signal);
+    }
+  );
+  await withPretix(
+    (path) => {
+      if (path.startsWith("/orders?")) return json({ results: [order("B", "buyer@x.io", [pos({ attendee_email: "friend@x.io" })])] });
+      if (path === "/orderpositions/20/") return json(pos({ id: 20, order: "C", item: 2 }));
+      if (path === "/orders/C/") return json(order("C", me, [pos({ id: 20, order: "C", item: 2 })]));
+      return json({}, 404);
+    },
+    async () => check("fast path: no for other people's tickets and merchandise", !(await owns(Promise.resolve([{ positionId: 20 }, { positionId: 404 }])))),
+  );
+  await withPretix(
+    (path) => {
+      if (path.startsWith("/orders?")) return json({ results: [] });
+      if (path === "/orderpositions/30/") return json(pos({ id: 30, order: "D", item: 3 }));
+      if (path === "/orders/D/") return json(order("D", me, [pos({ id: 30, order: "D", item: 3 })]));
+      if (path === "/orderpositions/31/") return json(pos({ id: 31, order: "E", attendee_email: "holder@x.io" }));
+      if (path === "/orders/E/") return json(order("E", me, [pos({ id: 31, order: "E", attendee_email: "holder@x.io" })]));
+      return json({}, 404);
+    },
+    async () =>
+      check(
+        "fast path: attached item without the admission flag and an email-proof link handed to someone else say no",
+        !(await owns(Promise.resolve([{ positionId: 30 }, { positionId: 31, proof: "email" }])))
+      ),
+  );
+  await withPretix(
+    (path) => {
+      if (path.startsWith("/orders?")) return json({ results: [] });
+      if (path === "/orderpositions/40/") return json(pos({ id: 40, order: "F" }));
+      if (path === "/orders/F/") return json(order("F", "someone@x.io", [pos({ id: 40, order: "F" })]));
+      return json({}, 404);
+    },
+    async (calls) => {
+      check("fast path: a QR-attached ticket answers yes", await owns(Promise.resolve([{ positionId: 40 }, { positionId: -1 }])));
+      check("fast path: fixture links are never looked up", !calls.some((c) => c.url.includes("/orderpositions/-1")));
+    }
+  );
+  await withPretix(
+    (path) => (path.startsWith("/orders?") ? json({ results: [order("G", me, [pos({})])] }) : json({}, 404)),
+    async () => check("fast path: email yes despite the links lookup failing", await owns(Promise.reject(new Error("supabase down")))),
+  );
+  await withPretix(
+    () => json({}, 500),
+    async () => check("fast path: throws when nobody says yes and Pretix failed", await owns(Promise.resolve([])).then(() => false, () => true)),
+  );
+  await withPretix(
+    () => json({}, 404),
+    async (calls) => {
+      const early = Promise.resolve([order("H", me, [pos({})])]);
+      check("fast path: a search started by the caller is used", await owns(Promise.resolve([]), early));
+      check("fast path: and not repeated", !calls.some((c) => c.url.includes("/orders?")));
+    }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  process.off("unhandledRejection", onUnhandled);
+  check("fast path: no unhandled rejections", unhandled.length === 0, unhandled.map(String).join("; "));
+  if (savedFixture === undefined) delete process.env.TICKET_TEST_INDIA_ORDER_CODE;
+  else process.env.TICKET_TEST_INDIA_ORDER_CODE = savedFixture;
+}
+
 async function main() {
   testNormalize();
   testTimelineFold();
   testReminders();
   testMeerkatHandover();
+  await testMeerkatFastPath();
   testDayParam();
   testReminderCatalogue();
   testIosVersion();

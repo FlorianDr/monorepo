@@ -64,6 +64,18 @@ export function parseAuthCookie(
   }
 }
 
+/** A JWT's payload object, decoded without verifying the signature; null if malformed. */
+function jwtPayload(token: string): Record<string, unknown> | null {
+  const parts = token.split(".");
+  if (parts.length !== 3 || !parts[1]) return null;
+  try {
+    const payload: unknown = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The `exp` claim of a JWT, in seconds, read without verifying it: enough to
  * refuse an already-expired token before handing it to the auth library,
@@ -71,13 +83,20 @@ export function parseAuthCookie(
  * tokens). Null for anything that is not a three-part token with a numeric exp.
  */
 export function jwtExpiresAt(token: string): number | null {
-  const parts = token.split(".");
-  if (parts.length !== 3 || !parts[1]) return null;
-  try {
-    const payload: unknown = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-    const exp = payload && typeof payload === "object" ? (payload as Record<string, unknown>).exp : null;
-    return typeof exp === "number" && Number.isFinite(exp) ? exp : null;
-  } catch {
-    return null;
-  }
+  const exp = jwtPayload(token)?.exp;
+  return typeof exp === "number" && Number.isFinite(exp) ? exp : null;
+}
+
+/**
+ * The email a JWT claims and its `exp` (seconds), read WITHOUT verifying it.
+ * Never proof of identity: only a hint to start work early that is used once
+ * the auth server has confirmed the same email (api/meerkat/go/route.ts).
+ * Null unless the token carries a string email and a numeric exp.
+ */
+export function jwtClaims(token: string): { email: string; exp: number } | null {
+  const payload = jwtPayload(token);
+  const email = payload?.email;
+  const exp = payload?.exp;
+  if (typeof email !== "string" || !email || typeof exp !== "number" || !Number.isFinite(exp)) return null;
+  return { email, exp };
 }

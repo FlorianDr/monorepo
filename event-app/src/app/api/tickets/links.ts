@@ -30,15 +30,20 @@ export function hashSecret(secret: string): string {
   return createHash("sha256").update(secret).digest("hex");
 }
 
-export async function listLinks(userId: string, event: string): Promise<TicketLink[]> {
+export async function listLinks(
+  userId: string,
+  event: string,
+  signal?: AbortSignal
+): Promise<TicketLink[]> {
   const db = serviceClient();
   if (!db) return [];
-  const { data, error } = await db
+  const query = db
     .from(TABLE)
     .select("position_id, proof")
     .eq("user_id", userId)
     .eq("event", event)
     .order("attached_at", { ascending: true });
+  const { data, error } = await (signal ? query.abortSignal(signal) : query);
   if (error) throw new Error(error.message);
   return (data ?? []).map((row) => ({
     positionId: Number(row.position_id),

@@ -1,15 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import APP_CONFIG from "@/CONFIG";
 import { cookieUser } from "@/data/auth/cookieUser";
-import { authCookieName } from "@/data/auth/authCookie";
+import { authCookieName, jwtClaims, parseAuthCookie } from "@/data/auth/authCookie";
 import { healScript } from "./heal";
 import { SIGN_IN_PATH, signInHref } from "@/routing/returnTo";
 import { detailHref } from "@/routing/viewParams";
 import { createRateLimiter } from "../../tickets/rateLimit";
 import { listLinks } from "../../tickets/links";
-import { getStoreFromEnv, getTicketsForUser } from "../../tickets/pretix";
+import { getStoreFromEnv, ownsAdmissionTicket, searchPaidOrders, type PretixOrder } from "../../tickets/pretix";
 import { generateHandoverToken } from "../verification";
 import { isSessionId, meerkatSessionUrl } from "../handover";
+import { canStartEarly, resolveIdentity } from "../earlyStart";
 
 /**
  * The "Ask a question" link: `GET /api/meerkat/go?session=<id>` is a plain
@@ -26,10 +27,21 @@ import { isSessionId, meerkatSessionUrl } from "../handover";
  * the verified session email, never client-supplied. Failures render a small
  * page in that tab; nothing here is JSON.
  *
- * Per user only: attendees at the venue share a few NAT addresses, and an
- * anonymous request does no Pretix work anyway.
+ * Speed: the Pretix email search, the slowest lookup, starts on the email the
+ * cookie claims while the auth server verifies it, and is used only when the
+ * verified email is the same (earlyStart.ts). The ticket links wait for the
+ * verified user id. ownsAdmissionTicket runs the lookups in parallel and the
+ * first that finds a ticket answers; everything still running is cancelled
+ * when the answer is known or the visitor goes away.
+ *
+ * Per user: attendees at the venue share a few NAT addresses. An anonymous
+ * request can only start a search early, within the budgets below.
  */
 const perUser = createRateLimiter(20, 10 * 60_000);
+const earlyStart = {
+  perIp: createRateLimiter(10, 60_000),
+  global: createRateLimiter(60, 60_000),
+};
 
 export async function GET(request: NextRequest) {
   const sessionId = request.nextUrl.searchParams.get("session") ?? "";
@@ -40,7 +52,46 @@ export async function GET(request: NextRequest) {
   // gets redirected to the slug page by src/proxy.ts).
   const back = detailHref("session", sessionId);
 
-  const { configured, hadCookie, user, reason } = await cookieUser(request.cookies.getAll());
+  // Work for this request: cancelled once the answer is known (finally) or
+  // when the visitor goes away.
+  const work = new AbortController();
+  const stop = () => work.abort();
+  request.signal.addEventListener("abort", stop, { once: true });
+  try {
+    return await handOff(request, sessionId, back, work.signal);
+  } finally {
+    request.signal.removeEventListener("abort", stop);
+    work.abort();
+  }
+}
+
+async function handOff(
+  request: NextRequest,
+  sessionId: string,
+  back: string,
+  signal: AbortSignal
+): Promise<NextResponse> {
+  const cookies = request.cookies.getAll();
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const session = supabaseUrl ? parseAuthCookie(cookies, supabaseUrl) : null;
+  const store = getStoreFromEnv();
+
+  // Started on the claimed email, unverified: only a head start (see top).
+  let early: { email: string; orders: Promise<PretixOrder[]>; cancel: () => void } | null = null;
+  const claims = session ? jwtClaims(session.access_token) : null;
+  if (
+    store &&
+    claims &&
+    claims.exp * 1000 > Date.now() &&
+    canStartEarly(request.headers.get("x-nf-client-connection-ip"), earlyStart)
+  ) {
+    const own = new AbortController();
+    const orders = searchPaidOrders(claims.email, store, AbortSignal.any([signal, own.signal]));
+    orders.catch(() => {}); // awaited later, or dropped
+    early = { email: claims.email, orders, cancel: () => own.abort() };
+  }
+
+  const { configured, hadCookie, user, reason } = await cookieUser(cookies, session);
   if (!configured) return page(500, "Q&A unavailable", "Sign-in isn't configured on this deployment.", { back });
   if (!user?.email) {
     // Two different failures hide behind one 401: no cookie at all (the
@@ -68,19 +119,26 @@ export async function GET(request: NextRequest) {
     return page(429, "Too many attempts", "Please wait a few minutes before trying again.", { back });
   }
 
-  const store = getStoreFromEnv();
   if (!store) {
     console.error("[/api/meerkat/go] Pretix not configured, refusing to issue token");
     return page(503, "Q&A unavailable", "Ticketing isn't configured on this deployment.", { back });
   }
 
+  // The early search counts only for the verified email; a stale claim
+  // (email changed since the token was issued) searches again.
+  let emailOrders: Promise<PretixOrder[]> | undefined;
+  if (early) {
+    if (resolveIdentity(early.email, user.email) === "reuse") emailOrders = early.orders;
+    else early.cancel();
+  }
+
   let ownsTicket = false;
   try {
-    const { orders } = await getTicketsForUser(
-      { email: user.email, links: await listLinks(user.id, store.eventSlug) },
-      store
+    ownsTicket = await ownsAdmissionTicket(
+      { email: user.email, links: listLinks(user.id, store.eventSlug, signal), emailOrders },
+      store,
+      signal
     );
-    ownsTicket = orders.some((order) => order.tickets.some((ticket) => ticket.admission !== false));
   } catch (err) {
     console.error("[/api/meerkat/go] ticket lookup failed:", err);
     return page(502, "Couldn't verify your ticket", "The ticket service didn't answer. Please try again in a moment.", { back });

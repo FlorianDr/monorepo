@@ -1,4 +1,5 @@
 import type { Order, Ticket, TicketAddon, TicketStyle } from "@/data/tickets/types";
+import { hasAdmissionTicket } from "@/data/tickets/primary";
 import { mirrorPicture } from "./pictures";
 import { applyFixture, isFixturePositionId, parseFixture, resolveFixtureSwag } from "./testFixture";
 
@@ -365,6 +366,29 @@ function fixtureContext(catalog: Map<number, PretixItem>) {
 }
 
 /**
+ * Paid orders Pretix finds for `email`: its `search` matches the order email
+ * and attendee emails (and names), so callers must still keep only the
+ * positions that belong to the email (positionMatchesEmail).
+ */
+export async function searchPaidOrders(
+  email: string,
+  store: PretixStore,
+  signal?: AbortSignal
+): Promise<PretixOrder[]> {
+  if (!store.apiKey) throw new Error("PRETIX_API_KEY is missing");
+  const params = new URLSearchParams({ status: "p", search: email });
+  const response = await fetch(`${baseFor(store)}/orders?${params}`, {
+    headers: headersFor(store),
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`Pretix API error: ${response.status}`);
+  }
+  const data = await response.json();
+  return data.results ?? [];
+}
+
+/**
  * Fetch paid Pretix orders for an email and normalize them into Orders.
  * Ported from devconnect-app's getPaidTicketsByEmail, generalized to a single
  * configurable store. `itemsMap` can be passed by callers that already loaded
@@ -377,19 +401,8 @@ export async function getPaidTicketsByEmail(
   itemsMap?: Map<number, PretixItem>,
   { withFixture = true }: { withFixture?: boolean } = {}
 ): Promise<Order[]> {
-  if (!store.apiKey) throw new Error("PRETIX_API_KEY is missing");
   const catalog = itemsMap ?? (await loadCatalog(store));
-
-  // Paid orders matching this email.
-  const params = new URLSearchParams({ status: "p", search: email });
-  const response = await fetch(`${baseFor(store)}/orders?${params}`, {
-    headers: headersFor(store),
-  });
-  if (!response.ok) {
-    throw new Error(`Pretix API error: ${response.status}`);
-  }
-  const data = await response.json();
-  const orders: PretixOrder[] = data.results ?? [];
+  const orders = await searchPaidOrders(email, store);
 
   // Test fixture (see testFixture.ts): mirror the swag photos it borrows too.
   const fx = fixtureContext(catalog);
@@ -601,4 +614,147 @@ export async function getTicketsForUser(
     orders.unshift(holder);
   }
   return { orders, deadLinks };
+}
+
+/**
+ * Whether a position is an admission ticket in its own right: not an add-on,
+ * not canceled, and an item that is not merchandise. Mirrors what
+ * normalizeOrder + isAdmission (data/tickets/primary.ts) decide: an item the
+ * catalog does not know counts, an item without `admission: true` does not.
+ * The paid check and the email match stay with the caller.
+ */
+export function positionCountsAsAdmission(
+  position: PretixPosition,
+  itemsMap: Map<number, PretixItem>
+): boolean {
+  if (position.addon_to || position.canceled) return false;
+  const item = itemsMap.get(position.item);
+  return !item || item.admission === true;
+}
+
+/**
+ * True as soon as one check says yes, false when all finished without one,
+ * and the first error when none said yes and one failed. Every check gets a
+ * handler, so checks still running (or failing) after the answer never
+ * surface as unhandled rejections.
+ */
+export function anyTrue(checks: Promise<boolean>[]): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    let pending = checks.length;
+    let failure: { error: unknown } | null = null;
+    if (pending === 0) return resolve(false);
+    const settle = () => {
+      if (--pending === 0) {
+        if (failure) reject(failure.error);
+        else resolve(false);
+      }
+    };
+    for (const check of checks) {
+      check.then(
+        (yes) => {
+          if (yes) resolve(true);
+          settle();
+        },
+        (error) => {
+          failure ??= { error };
+          settle();
+        }
+      );
+    }
+  });
+}
+
+/**
+ * Whether the account holds an admission ticket: the yes-or-no behind the
+ * Meerkat hand-off (api/meerkat/go/route.ts), without the work the tickets
+ * screen needs (no photo mirroring, no normalised orders, no dead-link
+ * pruning). Same verdict as getTicketsForUser + hasAdmissionTicket.
+ *
+ * The email search and each attached link run in parallel; the first that
+ * finds a ticket answers and cancels the rest through `signal`'s own child.
+ * A failed source only matters when no other said yes (then it throws, as
+ * the full lookup would). `links` may still be loading and `emailOrders` may
+ * have been started by the caller (it is then the caller's to cancel). The
+ * catalog fetch is shared and cached, so it is never cancelled.
+ */
+export async function ownsAdmissionTicket(
+  lookup: { email: string; links: Promise<TicketLink[]>; emailOrders?: Promise<PretixOrder[]> },
+  store: PretixStore,
+  signal?: AbortSignal
+): Promise<boolean> {
+  // Observed at once: either may reject while the other sources still run.
+  lookup.links.catch(() => {});
+  lookup.emailOrders?.catch(() => {});
+
+  // The dev/preview fixture adds tickets to matched orders: the full lookup knows how.
+  if (parseFixture(process.env.TICKET_TEST_INDIA_ORDER_CODE).length > 0) {
+    const { orders } = await getTicketsForUser({ email: lookup.email, links: await lookup.links }, store);
+    return hasAdmissionTicket(orders);
+  }
+
+  const done = new AbortController();
+  const cancel = signal ? AbortSignal.any([signal, done.signal]) : done.signal;
+  const headers = headersFor(store);
+  const catalog = loadCatalog(store);
+  catalog.catch(() => {});
+
+  const viaEmail = async (): Promise<boolean> => {
+    const orders = await (lookup.emailOrders ?? searchPaidOrders(lookup.email, store, cancel));
+    const itemsMap = await catalog;
+    return orders.some((order) =>
+      (order.positions ?? []).some(
+        (position) =>
+          positionMatchesEmail(position, order.email, lookup.email) &&
+          positionCountsAsAdmission(position, itemsMap)
+      )
+    );
+  };
+
+  // Several attached positions can share an order; fetch each order once.
+  const orderCache = new Map<string, Promise<PretixOrder | null>>();
+  const fetchOrder = (code: string): Promise<PretixOrder | null> => {
+    let pending = orderCache.get(code);
+    if (!pending) {
+      pending = fetch(`${baseFor(store)}/orders/${encodeURIComponent(code)}/`, {
+        headers,
+        signal: cancel,
+      }).then((r) => {
+        const outcome = pretixLookupOutcome(r);
+        if (outcome === "missing") return null;
+        if (outcome === "failed") throw new Error(`Pretix API error: ${r.status}`);
+        return r.json() as Promise<PretixOrder>;
+      });
+      pending.catch(() => {});
+      orderCache.set(code, pending);
+    }
+    return pending;
+  };
+
+  const viaLink = async ({ positionId, proof }: TicketLink): Promise<boolean> => {
+    // Fixture links only resolve with the fixture configured (handled above).
+    if (isFixturePositionId(positionId)) return false;
+    const res = await fetch(`${baseFor(store)}/orderpositions/${positionId}/`, {
+      headers,
+      signal: cancel,
+    });
+    const outcome = pretixLookupOutcome(res);
+    if (outcome === "missing") return false;
+    if (outcome === "failed") throw new Error(`Pretix API error: ${res.status}`);
+    const position: PretixPosition = await res.json();
+    const order = await fetchOrder(position.order);
+    const itemsMap = await catalog;
+    if (!order || !isAttachablePosition(position, order, itemsMap)) return false;
+    if (proof === "email" && !positionMatchesEmail(position, order.email, lookup.email)) {
+      return false;
+    }
+    return positionCountsAsAdmission(position, itemsMap);
+  };
+
+  const viaLinks = async (): Promise<boolean> => anyTrue((await lookup.links).map(viaLink));
+
+  try {
+    return await anyTrue([viaEmail(), viaLinks()]);
+  } finally {
+    done.abort();
+  }
 }
