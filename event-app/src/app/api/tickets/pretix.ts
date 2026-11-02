@@ -694,18 +694,17 @@ export function anyTrue(checks: Promise<boolean>[]): Promise<boolean> {
  * links lookup fails, where the full lookup throws.
  *
  * The email search and each attached link run in parallel; the first that
- * finds a ticket answers and cancels the rest through `signal`'s own child. `links` may still be loading and `emailOrders` may
- * have been started by the caller (it is then the caller's to cancel). The
- * catalog fetch is shared and cached, so it is never cancelled.
+ * finds a ticket answers and cancels the rest through `signal`'s own child.
+ * `links` may still be loading. The catalog fetch is shared and cached, so it
+ * is never cancelled.
  */
 export async function ownsAdmissionTicket(
-  lookup: { email: string; links: Promise<TicketLink[]>; emailOrders?: Promise<PretixOrder[]> },
+  lookup: { email: string; links: Promise<TicketLink[]> },
   store: PretixStore,
   signal?: AbortSignal
 ): Promise<boolean> {
-  // Observed at once: either may reject while the other sources still run.
+  // Observed at once: it may reject while the other sources still run.
   lookup.links.catch(() => {});
-  lookup.emailOrders?.catch(() => {});
 
   // The dev/preview fixture adds tickets to matched orders: the full lookup knows how.
   if (parseFixture(process.env.TICKET_TEST_INDIA_ORDER_CODE).length > 0) {
@@ -719,7 +718,7 @@ export async function ownsAdmissionTicket(
   catalog.catch(() => {});
 
   const viaEmail = async (): Promise<boolean> => {
-    const orders = await (lookup.emailOrders ?? searchPaidOrders(lookup.email, store, cancel));
+    const orders = await searchPaidOrders(lookup.email, store, cancel);
     const itemsMap = await catalog;
     return orders.some((order) =>
       (order.positions ?? []).some(

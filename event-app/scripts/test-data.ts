@@ -33,7 +33,6 @@ import { buyerOrdersToAssign, derivePrimary, hasAdmissionTicket, ticketChoices, 
 import type { Order } from "../src/data/tickets/types";
 import { createRateLimiter } from "../src/app/api/tickets/rateLimit";
 import { anyTrue, ownsAdmissionTicket, positionCollected, positionCountsAsAdmission, positionMatchesEmail, pretixLookupOutcome, redactBuyerIdentity, type PretixOrder, type PretixPosition, type PretixStore } from "../src/app/api/tickets/pretix";
-import { canStartEarly, resolveIdentity } from "../src/app/api/meerkat/earlyStart";
 import {
   applyLink,
   assistantUrl,
@@ -80,7 +79,7 @@ import {
 } from "../src/data/reminders/reminders";
 import { RETURN_PARAM, safeReturnPath, signInHref } from "../src/routing/returnTo";
 import { syncSessionCookie, whenSessionCookieSettled } from "../src/data/auth/sessionCookie";
-import { authCookieName, jwtClaims, jwtExpiresAt, parseAuthCookie } from "../src/data/auth/authCookie";
+import { authCookieName, jwtExpiresAt, parseAuthCookie } from "../src/data/auth/authCookie";
 import { HEAL_EXPIRY_MARGIN_S, healScriptBody } from "../src/app/api/meerkat/go/heal";
 import { createSupabaseFetch, isTokenRateLimit } from "../src/data/auth/supabaseFetch";
 import { sessionCardHash, sessionCardUrl } from "../src/data/sessionCard";
@@ -1572,39 +1571,10 @@ function testLiveWindowAndStreams() {
 }
 
 /**
- * The fast Meerkat hand-off (api/meerkat/go): the unverified head start and
- * the lean ticket check, against a stubbed Pretix.
+ * The fast Meerkat hand-off (api/meerkat/go): the lean ticket check, against
+ * a stubbed Pretix.
  */
 async function testMeerkatFastPath() {
-  // jwtClaims: a hint read without verification.
-  const jwt = (payload: unknown) =>
-    `h.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.s`;
-  check("fast path: jwtClaims reads email and exp", eq(jwtClaims(jwt({ email: "a@x.io", exp: 5 })), { email: "a@x.io", exp: 5 }));
-  check(
-    "fast path: jwtClaims refuses tokens without a string email or numeric exp",
-    jwtClaims(jwt({ exp: 5 })) === null && jwtClaims(jwt({ email: "a@x.io" })) === null && jwtClaims("not-a-jwt") === null
-  );
-  check("fast path: jwtExpiresAt still reads exp", jwtExpiresAt(jwt({ exp: 7 })) === 7);
-
-  // canStartEarly: Netlify's address only, within both budgets.
-  const limits = (perIp: number, global: number) => ({
-    perIp: createRateLimiter(perIp, 60_000),
-    global: createRateLimiter(global, 60_000),
-  });
-  check("fast path: no head start without Netlify's client address", !canStartEarly(null, limits(5, 5)));
-  const perIp = limits(1, 5);
-  check("fast path: per-address budget", canStartEarly("1.1.1.1", perIp) && !canStartEarly("1.1.1.1", perIp) && canStartEarly("2.2.2.2", perIp));
-  const global = limits(5, 1);
-  check("fast path: global cap per instance", canStartEarly("1.1.1.1", global) && !canStartEarly("2.2.2.2", global));
-
-  // resolveIdentity: the claim counts only for the very same verified email.
-  check(
-    "fast path: identity resolution",
-    resolveIdentity("a@x.io", "a@x.io") === "reuse" &&
-      resolveIdentity("old@x.io", "new@x.io") === "restart" &&
-      resolveIdentity("a@x.io", null) === "unauthenticated"
-  );
-
   // positionCountsAsAdmission mirrors normalizeOrder + isAdmission.
   const items = new Map([
     [1, { id: 1, name: "Ticket", admission: true }],
@@ -1658,8 +1628,8 @@ async function testMeerkatFastPath() {
   const onUnhandled = (reason: unknown) => unhandled.push(reason);
   process.on("unhandledRejection", onUnhandled);
   const me = "me@x.io";
-  const owns = (links: Promise<{ positionId: number; proof?: "email" | "qr" }[]>, emailOrders?: Promise<PretixOrder[]>) =>
-    ownsAdmissionTicket({ email: me, links, emailOrders }, store);
+  const owns = (links: Promise<{ positionId: number; proof?: "email" | "qr" }[]>) =>
+    ownsAdmissionTicket({ email: me, links }, store);
 
   await withPretix(
     (path, signal) => (path.startsWith("/orders?") ? json({ results: [order("A", me, [pos({})])] }) : hang(signal)),
@@ -1714,14 +1684,6 @@ async function testMeerkatFastPath() {
   await withPretix(
     () => json({}, 500),
     async () => check("fast path: throws when nobody says yes and Pretix failed", await owns(Promise.resolve([])).then(() => false, () => true)),
-  );
-  await withPretix(
-    () => json({}, 404),
-    async (calls) => {
-      const early = Promise.resolve([order("H", me, [pos({})])]);
-      check("fast path: a search started by the caller is used", await owns(Promise.resolve([]), early));
-      check("fast path: and not repeated", !calls.some((c) => c.url.includes("/orders?")));
-    }
   );
   await new Promise((resolve) => setTimeout(resolve, 20));
   process.off("unhandledRejection", onUnhandled);

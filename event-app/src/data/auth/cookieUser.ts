@@ -1,5 +1,5 @@
 import { createClient, type SupabaseClient, type User } from "@supabase/supabase-js";
-import { parseAuthCookie, type CookieSession } from "./authCookie";
+import { parseAuthCookie } from "./authCookie";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -34,15 +34,13 @@ export interface CookieUser {
  * server per call; the result is authentic, so it can gate actions.
  */
 export async function cookieUser(
-  cookies: readonly { name: string; value: string }[],
-  /** The session already parsed from these cookies (parseAuthCookie), to avoid parsing twice. */
-  parsed?: CookieSession | null
+  cookies: readonly { name: string; value: string }[]
 ): Promise<CookieUser> {
   const client = getValidator();
   if (!client || !supabaseUrl) {
     return { configured: false, hadCookie: false, user: null, reason: "auth not configured" };
   }
-  const session = parsed !== undefined ? parsed : parseAuthCookie(cookies, supabaseUrl);
+  const session = parseAuthCookie(cookies, supabaseUrl);
   if (!session) return { configured: true, hadCookie: false, user: null, reason: null };
   const { data, error } = await client.auth.getUser(session.access_token);
   return {
